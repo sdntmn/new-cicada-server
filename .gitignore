@@ -1,0 +1,13 @@
+.vercel
+# dependencies
+/node_modules
+
+# env
+.env.local
+.env
+
+# logs
+npm-debug.log*
+yarn.*
+yarn-error.log*
+dist
