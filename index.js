@@ -19,7 +19,7 @@ if (!supabaseUrl || !supabaseAnonKey) {
 const supabase = createClient(supabaseUrl, supabaseAnonKey);
 
 // ===================================================================
-// Эндпоинт: получить список долговых кейсов (таблица)
+// Эндпоинт: получить список долговых кейсов (с JOIN)
 // ===================================================================
 app.get("/debt-cases", async (req, res) => {
   const {
@@ -29,9 +29,7 @@ app.get("/debt-cases", async (req, res) => {
     status,
     minDebt,
     maxDebt,
-    minPenalty,
-    maxPenalty,
-    hasDebtor, // true = только с должником, false = только без
+    hasResponsibleParty, // true = только с ответственным лицом
   } = req.query;
 
   const size = Math.min(Math.max(parseInt(pageSize, 10) || 20, 1), 100);
@@ -45,17 +43,23 @@ app.get("/debt-cases", async (req, res) => {
         `
         *,
         premises:premises_id (
+          id,
           city,
           street,
           house,
           apartment,
           full_address
         ),
-        debtor:debtor_id (
+        responsible_party:responsible_party_id (
+          id,
+          type,
           fio,
+          legal_name,
           phone,
           email,
-          verified
+          represents_minor,
+          minor_fio,
+          relation_to_minor
         )
       `,
         { count: "exact" }
@@ -69,36 +73,52 @@ app.get("/debt-cases", async (req, res) => {
     if (status) {
       query = query.eq("status", status);
     }
-    if (minDebt) {
-      query = query.gte("total_debt", parseFloat(minDebt));
-    }
-    if (maxDebt) {
-      query = query.lte("total_debt", parseFloat(maxDebt));
-    }
-    if (minPenalty) {
-      query = query.gte("penalty", parseFloat(minPenalty));
-    }
-    if (maxPenalty) {
-      query = query.lte("penalty", parseFloat(maxPenalty));
-    }
-    if (hasDebtor === "true") {
-      query = query.not("debtor_id", "is", null);
-    } else if (hasDebtor === "false") {
-      query = query.is("debtor_id", null);
+    if (hasResponsibleParty === "true") {
+      query = query.not("responsible_party_id", "is", null);
+    } else if (hasResponsibleParty === "false") {
+      query = query.is("responsible_party_id", null);
     }
 
     // Пагинация
     query = query.range(from, to);
 
-    const { data, error, count } = await query;
+    const { data: cases, error, count } = await query;
 
     if (error) {
       console.error("Supabase error:", error);
       return res.status(500).json({ error: error.message });
     }
 
-    // Добавляем rowIndex (нумерация в выдаче)
-    const dataWithIndex = data.map((row, i) => ({
+    // Для каждого кейса загружаем debt_obligations
+    const casesWithObligations = await Promise.all(
+      cases.map(async (debtCase) => {
+        if (
+          !debtCase.debt_obligation_ids ||
+          debtCase.debt_obligation_ids.length === 0
+        ) {
+          return { ...debtCase, debt_obligations: [] };
+        }
+
+        const { obligations } = await supabase
+          .from("debt_obligation")
+          .select(
+            `
+            *,
+            service_provider:service_provider_id (
+              id,
+              name,
+              type
+            )
+          `
+          )
+          .in("id", debtCase.debt_obligation_ids);
+
+        return { ...debtCase, debt_obligations: obligations || [] };
+      })
+    );
+
+    // Добавляем rowIndex
+    const dataWithIndex = casesWithObligations.map((row, i) => ({
       ...row,
       rowIndex: page * size + i + 1,
     }));
@@ -122,52 +142,60 @@ app.get("/debt-cases/:id", async (req, res) => {
   const { id } = req.params;
 
   try {
-    // Основные данные кейса + premises + debtor
-    const { data: caseData, error: caseError } = await supabase
+    // Основные данные кейса + premises + responsible_party
+    const { caseData } = await supabase
       .from("debt_case")
       .select(
         `
         *,
         premises:premises_id (*),
-        debtor:debtor_id (*)
+        responsible_party:responsible_party_id (*)
       `
       )
       .eq("id", id)
       .single();
 
-    if (caseError) {
-      if (caseError.code === "PGRST116") {
-        return res.status(404).json({ error: "Debt case not found" });
-      }
-      return res.status(500).json({ error: caseError.message });
+    if (!caseData) {
+      return res.status(404).json({ error: "Debt case not found" });
+    }
+
+    // Загружаем обязательства
+    let obligations = [];
+    if (
+      caseData.debt_obligation_ids &&
+      caseData.debt_obligation_ids.length > 0
+    ) {
+      const { obs } = await supabase
+        .from("debt_obligation")
+        .select(
+          `
+          *,
+          service_provider:service_provider_id (*)
+        `
+        )
+        .in("id", caseData.debt_obligation_ids);
+      obligations = obs || [];
     }
 
     // История событий
-    const { data: events } = await supabase
+    const { events } = await supabase
       .from("case_event")
       .select("*")
       .eq("debt_case_id", id)
       .order("created_at", { ascending: false });
 
     // Документы
-    const { data: documents } = await supabase
+    const { documents } = await supabase
       .from("document")
       .select("*")
       .eq("debt_case_id", id)
       .order("created_at", { ascending: false });
 
-    // Платежи (если есть)
-    const { data: payments } = await supabase
-      .from("payment")
-      .select("*")
-      .eq("debt_case_id", id)
-      .order("payment_date", { ascending: false });
-
     res.json({
       ...caseData,
+      debt_obligations: obligations,
       events,
       documents,
-      payments,
     });
   } catch (err) {
     console.error("Error in /debt-cases/:id:", err);
@@ -176,7 +204,7 @@ app.get("/debt-cases/:id", async (req, res) => {
 });
 
 // ===================================================================
-// Эндпоинт: получить список городов (для фильтра)
+// Эндпоинт: получить список городов
 // ===================================================================
 app.get("/cities", async (req, res) => {
   try {
@@ -198,19 +226,28 @@ app.get("/cities", async (req, res) => {
 });
 
 // ===================================================================
-// Эндпоинт: обновить данные должника (после получения из суда)
+// Эндпоинт: привязать ответственное лицо к кейсу
 // ===================================================================
-app.patch("/debt-cases/:id/debtor", async (req, res) => {
+app.patch("/debt-cases/:id/responsible-party", async (req, res) => {
   const { id } = req.params;
-  const { fio, phone, email, verified = false } = req.body;
+  const {
+    type,
+    fio,
+    legal_name,
+    phone,
+    email,
+    represents_minor = false,
+    minor_fio,
+    relation_to_minor,
+  } = req.body;
 
-  if (!fio) {
-    return res.status(400).json({ error: "fio is required" });
+  if (!type) {
+    return res.status(400).json({ error: "type is required" });
   }
 
   try {
-    // Сначала проверим, существует ли кейс
-    const { data: caseExists } = await supabase
+    // Проверяем существование кейса
+    const { caseExists } = await supabase
       .from("debt_case")
       .select("id")
       .eq("id", id)
@@ -220,34 +257,30 @@ app.patch("/debt-cases/:id/debtor", async (req, res) => {
       return res.status(404).json({ error: "Debt case not found" });
     }
 
-    // Проверим, есть ли уже такой должник
-    let debtorId;
-    const { data: existingDebtor } = await supabase
-      .from("debtor")
+    // Создаём ответственное лицо
+    const { data: newParty, error: insertError } = await supabase
+      .from("responsible_party")
+      .insert({
+        type,
+        fio,
+        legal_name,
+        phone,
+        email,
+        represents_minor,
+        minor_fio,
+        relation_to_minor,
+      })
       .select("id")
-      .eq("fio", fio)
-      .limit(1);
+      .single();
 
-    if (existingDebtor && existingDebtor.length > 0) {
-      debtorId = existingDebtor[0].id;
-    } else {
-      // Создаём нового должника
-      const { data: newDebtor, error: insertError } = await supabase
-        .from("debtor")
-        .insert({ fio, phone, email, verified })
-        .select("id")
-        .single();
-
-      if (insertError) {
-        return res.status(500).json({ error: insertError.message });
-      }
-      debtorId = newDebtor.id;
+    if (insertError) {
+      return res.status(500).json({ error: insertError.message });
     }
 
     // Привязываем к кейсу
     const { error: updateError } = await supabase
       .from("debt_case")
-      .update({ debtor_id: debtorId })
+      .update({ responsible_party_id: newParty.id })
       .eq("id", id);
 
     if (updateError) {
@@ -257,14 +290,35 @@ app.patch("/debt-cases/:id/debtor", async (req, res) => {
     // Добавляем событие
     await supabase.from("case_event").insert({
       debt_case_id: id,
-      type: "debtor_assigned",
-      description: `Должник ${fio} привязан к кейсу`,
+      type: "responsible_party_assigned",
+      description: `Назначено ответственное лицо: ${fio || legal_name}`,
       created_by: "admin",
     });
 
-    res.json({ success: true, debtor_id: debtorId });
+    res.json({ success: true, responsible_party_id: newParty.id });
   } catch (err) {
-    console.error("Error in /debtor assignment:", err);
+    console.error("Error in /responsible-party assignment:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// ===================================================================
+// Эндпоинт: получить список поставщиков услуг (для фильтра/создания)
+// ===================================================================
+app.get("/service-providers", async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from("service_provider")
+      .select("*")
+      .order("name");
+
+    if (error) {
+      return res.status(500).json({ error: error.message });
+    }
+
+    res.json(data);
+  } catch (err) {
+    console.error("Error in /service-providers:", err);
     res.status(500).json({ error: "Internal server error" });
   }
 });
@@ -274,6 +328,7 @@ app.patch("/debt-cases/:id/debtor", async (req, res) => {
 // ===================================================================
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`✅ Debt Management Server running on port ${PORT}`);
-  console.log(`🧪 Try: GET http://localhost:${PORT}/debt-cases`);
+  console.log(
+    `✅ Debt Management Server (расширенная модель) running on port ${PORT}`
+  );
 });
