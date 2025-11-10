@@ -18,33 +18,30 @@ if (!supabaseUrl || !supabaseAnonKey) {
 
 const supabase = createClient(supabaseUrl, supabaseAnonKey);
 
+// ===================================================================
+// Эндпоинт: получить список помещений (premises)
+// ===================================================================
 app.get("/premises", async (req, res) => {
-  // Поддержка фильтрации и пагинации (опционально)
-  const {
-    page = 0,
-    pageSize = 100, // увеличьте, если нужно много
-    city,
-    street,
-    house,
-  } = req.query;
+  const { page = 0, pageSize = 20, city, street, house } = req.query;
 
-  const size = Math.min(Math.max(parseInt(pageSize, 10) || 100, 1), 500); // лимит
+  // Ограничиваем pageSize согласно фронтенду: [10, 20, 50, 100]
+  const size = Math.min(Math.max(parseInt(pageSize, 10) || 20, 10), 100);
   const from = page * size;
   const to = from + size - 1;
 
   try {
     let query = supabase
       .from("premises")
-      .select("*", { count: "exact" })
+      .select("*, count", { count: "exact" }) // count через RPC
       .order("city")
       .order("street")
-      .order("house", { ascending: true, nullsFirst: false })
+      .order("house", { ascending: true })
       .order("apartment", { ascending: true, nullsFirst: true });
 
-    // Фильтры
+    // Фильтрация
     if (city) query = query.eq("city", city);
-    if (street) query = query.ilike("street", `%${street}%`);
-    if (house) query = query.eq("house", house);
+    if (street) query = query.ilike("street", `%${street.trim()}%`);
+    if (house) query = query.eq("house", house.trim());
 
     // Пагинация
     query = query.range(from, to);
