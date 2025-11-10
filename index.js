@@ -19,46 +19,35 @@ if (!supabaseUrl || !supabaseAnonKey) {
 const supabase = createClient(supabaseUrl, supabaseAnonKey);
 
 // ===================================================================
-// Эндпоинт: получить список помещений (premises)
+// Эндпоинт: получить список помещений (без пагинации, без count)
 // ===================================================================
 app.get("/premises", async (req, res) => {
-  const { page = 0, pageSize = 20, city, street, house } = req.query;
-
-  // Ограничиваем pageSize согласно фронтенду: [10, 20, 50, 100]
-  const size = Math.min(Math.max(parseInt(pageSize, 10) || 20, 10), 100);
-  const from = page * size;
-  const to = from + size - 1;
+  const { city, street, house } = req.query;
 
   try {
     let query = supabase
       .from("premises")
-      .select("*, count", { count: "exact" }) // count через RPC
+      .select("*") // ← просто все поля, без count!
       .order("city")
       .order("street")
       .order("house", { ascending: true })
       .order("apartment", { ascending: true, nullsFirst: true });
 
-    // Фильтрация
     if (city) query = query.eq("city", city);
     if (street) query = query.ilike("street", `%${street.trim()}%`);
     if (house) query = query.eq("house", house.trim());
 
-    // Пагинация
-    query = query.range(from, to);
+    // Защита от слишком больших выгрузок
+    query = query.limit(1000);
 
-    const { data, error, count } = await query;
+    const { data, error } = await query;
 
     if (error) {
       console.error("Supabase error in /premises:", error);
       return res.status(500).json({ error: error.message });
     }
 
-    res.json({
-      data,
-      total: count,
-      page: parseInt(page, 10),
-      pageSize: size,
-    });
+    res.json(data); // ← просто массив
   } catch (err) {
     console.error("Unexpected error in /premises:", err);
     res.status(500).json({ error: "Internal server error" });
