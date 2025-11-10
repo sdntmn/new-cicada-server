@@ -188,7 +188,7 @@ app.get("/debt-cases", async (req, res) => {
 });
 
 // ===================================================================
-// Эндпоинт: получить карточку кейса по ID
+// Эндпоинт: получить карточку кейса по ID (с детализацией)
 // ===================================================================
 app.get("/debt-cases/:id", async (req, res) => {
   const { id } = req.params;
@@ -221,12 +221,41 @@ app.get("/debt-cases/:id", async (req, res) => {
         service_provider:service_provider_id (*)
       `
       )
-      .eq("debt_case_id", id);
+      .eq("debt_case_id", id)
+      .order("period_end", { ascending: false });
 
     if (obligationsError) {
       console.error("Error loading obligations:", obligationsError);
       return res.status(500).json({ error: "Error loading obligations" });
     }
+
+    // Группируем долги по типам услуг
+    const debtsByType = {};
+
+    obligations.forEach((obligation) => {
+      const providerName =
+        obligation.service_provider?.name || "Неизвестный поставщик";
+      const providerType = obligation.service_provider?.type || "other";
+
+      if (!debtsByType[providerName]) {
+        debtsByType[providerName] = {
+          provider_name: providerName,
+          provider_type: providerType,
+          debt_sum: 0,
+          penalty_sum: 0,
+          obligations: [],
+        };
+      }
+
+      const debt = parseFloat(obligation.debt_sum) || 0;
+      const penalty = parseFloat(obligation.penalty_sum) || 0;
+
+      debtsByType[providerName].debt_sum += debt;
+      debtsByType[providerName].penalty_sum += penalty;
+      debtsByType[providerName].obligations.push(obligation);
+    });
+
+    const debtDetails = Object.values(debtsByType);
 
     // История событий
     const { data: events, error: eventsError } = await supabase
@@ -245,8 +274,19 @@ app.get("/debt-cases/:id", async (req, res) => {
     res.json({
       ...caseData,
       debt_obligations: obligations || [],
+      debt_details: debtDetails, // Детализация по типам долгов
       events: events || [],
       documents: documents || [],
+      summary: {
+        total_debt: debtDetails.reduce((sum, item) => sum + item.debt_sum, 0),
+        total_penalty: debtDetails.reduce(
+          (sum, item) => sum + item.penalty_sum,
+          0
+        ),
+        debt_types_count: debtDetails.length,
+        obligations_count: obligations.length,
+        service_providers: debtDetails.map((item) => item.provider_name),
+      },
     });
   } catch (err) {
     console.error("Error in /debt-cases/:id:", err);
@@ -255,7 +295,7 @@ app.get("/debt-cases/:id", async (req, res) => {
 });
 
 // ===================================================================
-// Эндпоинт: получить список долговых кейсов (с долгами и ЛС)
+// Эндпоинт: получить список долговых кейсов (с детализацией по долгам)
 // ===================================================================
 app.get("/debt-cases", async (req, res) => {
   const {
@@ -341,7 +381,8 @@ app.get("/debt-cases", async (req, res) => {
             )
           `
           )
-          .eq("debt_case_id", debtCase.id);
+          .eq("debt_case_id", debtCase.id)
+          .order("period_end", { ascending: false });
 
         if (obligationsError) {
           console.error("Error loading obligations:", obligationsError);
@@ -352,63 +393,71 @@ app.get("/debt-cases", async (req, res) => {
       })
     );
 
-    // Обрабатываем данные: добавляем сумму долга, срок и ЛС
+    // Обрабатываем данные: группируем по типам долгов
     const processedCases = casesWithObligations.map((row, i) => {
-      // Вычисляем общую сумму долга (основной долг + пени)
-      const totalDebt = row.debt_obligations.reduce((sum, obligation) => {
+      // Группируем долги по service_provider (виду услуги)
+      const debtsByType = {};
+
+      row.debt_obligations.forEach((obligation) => {
+        const providerName =
+          obligation.service_provider?.name || "Неизвестный поставщик";
+        const providerType = obligation.service_provider?.type || "other";
+
+        if (!debtsByType[providerName]) {
+          debtsByType[providerName] = {
+            provider_name: providerName,
+            provider_type: providerType,
+            debt_sum: 0,
+            penalty_sum: 0,
+            obligations: [],
+          };
+        }
+
         const debt = parseFloat(obligation.debt_sum) || 0;
         const penalty = parseFloat(obligation.penalty_sum) || 0;
-        return sum + debt + penalty;
-      }, 0);
 
-      // Находим самый старый и самый новый срок долга
-      const periods = row.debt_obligations
+        debtsByType[providerName].debt_sum += debt;
+        debtsByType[providerName].penalty_sum += penalty;
+        debtsByType[providerName].obligations.push(obligation);
+      });
+
+      // Преобразуем в массив
+      const debtDetails = Object.values(debtsByType);
+
+      // Находим самый старый срок долга
+      const allPeriods = row.debt_obligations
         .filter((obligation) => obligation.period_end)
         .map((obligation) => new Date(obligation.period_end))
         .sort((a, b) => a - b);
 
-      const oldestDebtDate = periods.length > 0 ? periods[0] : null;
-      const newestDebtDate =
-        periods.length > 0 ? periods[periods.length - 1] : null;
+      const oldestDebtDate = allPeriods.length > 0 ? allPeriods[0] : null;
 
-      // Форматируем срок долга для отображения
-      let debtPeriod = "Нет данных";
-      if (oldestDebtDate && newestDebtDate) {
-        if (oldestDebtDate.getTime() === newestDebtDate.getTime()) {
-          debtPeriod = `до ${formatDate(newestDebtDate)}`;
-        } else {
-          debtPeriod = `с ${formatDate(oldestDebtDate)} по ${formatDate(
-            newestDebtDate
-          )}`;
-        }
-      } else if (newestDebtDate) {
-        debtPeriod = `до ${formatDate(newestDebtDate)}`;
-      }
+      // Форматируем срок долга
+      const debtPeriod = oldestDebtDate
+        ? `до ${formatDate(oldestDebtDate)}`
+        : "Нет данных";
 
-      // Получаем ЛС (лицевой счет) из debt_obligation
-      // Берем первый попавшийся account из обязательств
+      // Получаем ЛС (берем первый попавшийся)
       const account =
         row.debt_obligations.find((obligation) => obligation.account)
           ?.account || "Не указан";
 
-      // Формируем полный адрес с ЛС
-      const addressWithAccount = row.premises?.full_address
-        ? `${row.premises.full_address} (ЛС: ${account})`
-        : "Адрес не указан";
-
       return {
         ...row,
         rowIndex: page * size + i + 1,
-        total_debt: totalDebt,
+        debt_details: debtDetails, // Детализация по типам долгов
         debt_period: debtPeriod,
         oldest_debt_date: oldestDebtDate,
-        newest_debt_date: newestDebtDate,
         account: account,
-        address_with_account: addressWithAccount,
-        // Дополнительная информация для отладки
+        // Для обратной совместимости - общие суммы
+        total_debt: debtDetails.reduce((sum, item) => sum + item.debt_sum, 0),
+        total_penalty: debtDetails.reduce(
+          (sum, item) => sum + item.penalty_sum,
+          0
+        ),
         _debug: {
           obligations_count: row.debt_obligations.length,
-          periods_count: periods.length,
+          debt_types_count: debtDetails.length,
         },
       };
     });
