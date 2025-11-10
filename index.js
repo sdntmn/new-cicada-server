@@ -324,6 +324,58 @@ app.get("/service-providers", async (req, res) => {
 });
 
 // ===================================================================
+// Эндпоинт: получить список пользователей (операторов)
+// ===================================================================
+app.get("/users", async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from("users")
+      .select("id, fio, email, role, is_active, created_at")
+      .eq("is_active", true) // только активные
+      .order("fio", { ascending: true });
+
+    if (error) {
+      console.error("Supabase error:", error);
+      return res.status(500).json({ error: error.message });
+    }
+
+    res.json(data);
+  } catch (err) {
+    console.error("Error in /users:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Получить пользователя по ID
+app.get("/users/:id", async (req, res) => {
+  const { id } = req.params;
+
+  if (!id) {
+    return res.status(400).json({ error: "User ID is required" });
+  }
+
+  try {
+    const { data, error } = await supabase
+      .from("users")
+      .select("id, fio, email, role, is_active, created_at")
+      .eq("id", id)
+      .single();
+
+    if (error) {
+      if (error.code === "PGRST116") {
+        return res.status(404).json({ error: "User not found" });
+      }
+      return res.status(500).json({ error: error.message });
+    }
+
+    res.json(data);
+  } catch (err) {
+    console.error("Error in /users/:id:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// ===================================================================
 // Запуск сервера
 // ===================================================================
 const PORT = process.env.PORT || 8080;
