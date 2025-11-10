@@ -18,6 +18,56 @@ if (!supabaseUrl || !supabaseAnonKey) {
 
 const supabase = createClient(supabaseUrl, supabaseAnonKey);
 
+app.get("/premises", async (req, res) => {
+  // Поддержка фильтрации и пагинации (опционально)
+  const {
+    page = 0,
+    pageSize = 100, // увеличьте, если нужно много
+    city,
+    street,
+    house,
+  } = req.query;
+
+  const size = Math.min(Math.max(parseInt(pageSize, 10) || 100, 1), 500); // лимит
+  const from = page * size;
+  const to = from + size - 1;
+
+  try {
+    let query = supabase
+      .from("premises")
+      .select("*", { count: "exact" })
+      .order("city")
+      .order("street")
+      .order("house", { ascending: true, nullsFirst: false })
+      .order("apartment", { ascending: true, nullsFirst: true });
+
+    // Фильтры
+    if (city) query = query.eq("city", city);
+    if (street) query = query.ilike("street", `%${street}%`);
+    if (house) query = query.eq("house", house);
+
+    // Пагинация
+    query = query.range(from, to);
+
+    const { data, error, count } = await query;
+
+    if (error) {
+      console.error("Supabase error in /premises:", error);
+      return res.status(500).json({ error: error.message });
+    }
+
+    res.json({
+      data,
+      total: count,
+      page: parseInt(page, 10),
+      pageSize: size,
+    });
+  } catch (err) {
+    console.error("Unexpected error in /premises:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
 // ===================================================================
 // Эндпоинт: получить список долговых кейсов (с JOIN)
 // ===================================================================
