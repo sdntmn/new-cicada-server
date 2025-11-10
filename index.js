@@ -255,72 +255,198 @@ app.get("/debt-cases/:id", async (req, res) => {
 });
 
 // ===================================================================
-// Эндпоинт: создать новое дело с долгами
+// Эндпоинт: получить список долговых кейсов (с долгами и ЛС)
 // ===================================================================
-app.post("/debt-cases", async (req, res) => {
+app.get("/debt-cases", async (req, res) => {
   const {
-    premises_id,
-    debt_obligation_ids,
-    responsible_party_id,
-    status = "new",
-  } = req.body;
+    page = 0,
+    pageSize = 20,
+    city,
+    status,
+    minDebt,
+    maxDebt,
+    hasResponsibleParty,
+  } = req.query;
 
-  if (!premises_id) {
-    return res.status(400).json({ error: "premises_id is required" });
-  }
-
-  if (!debt_obligation_ids || debt_obligation_ids.length === 0) {
-    return res
-      .status(400)
-      .json({ error: "At least one debt obligation is required" });
-  }
+  const size = Math.min(Math.max(parseInt(pageSize, 10) || 20, 1), 100);
+  const from = page * size;
+  const to = from + size - 1;
 
   try {
-    // Создаем дело
-    const { data: newCase, error: caseError } = await supabase
+    let query = supabase
       .from("debt_case")
-      .insert({
-        premises_id,
-        responsible_party_id,
-        status,
+      .select(
+        `
+        *,
+        premises:premises_id (
+          id,
+          city,
+          street,
+          house,
+          apartment,
+          full_address,
+          cadastral_number
+        ),
+        responsible_party:responsible_party_id (
+          id,
+          type,
+          fio,
+          legal_name,
+          phone,
+          email,
+          represents_minor,
+          minor_fio,
+          relation_to_minor
+        )
+      `,
+        { count: "exact" }
+      )
+      .order("created_at", { ascending: false });
+
+    // Фильтрация
+    if (city) {
+      query = query.eq("premises.city", city);
+    }
+    if (status) {
+      query = query.eq("status", status);
+    }
+    if (hasResponsibleParty === "true") {
+      query = query.not("responsible_party_id", "is", null);
+    } else if (hasResponsibleParty === "false") {
+      query = query.is("responsible_party_id", null);
+    }
+
+    // Пагинация
+    query = query.range(from, to);
+
+    const { data: cases, error, count } = await query;
+
+    if (error) {
+      console.error("Supabase error:", error);
+      return res.status(500).json({ error: error.message });
+    }
+
+    // Для каждого кейса загружаем debt_obligations через debt_case_id
+    const casesWithObligations = await Promise.all(
+      cases.map(async (debtCase) => {
+        const { data: obligations, error: obligationsError } = await supabase
+          .from("debt_obligation")
+          .select(
+            `
+            *,
+            service_provider:service_provider_id (
+              id,
+              name,
+              type
+            )
+          `
+          )
+          .eq("debt_case_id", debtCase.id);
+
+        if (obligationsError) {
+          console.error("Error loading obligations:", obligationsError);
+          return { ...debtCase, debt_obligations: [] };
+        }
+
+        return { ...debtCase, debt_obligations: obligations || [] };
       })
-      .select("id")
-      .single();
+    );
 
-    if (caseError) {
-      console.error("Error creating case:", caseError);
-      return res.status(500).json({ error: caseError.message });
-    }
+    // Обрабатываем данные: добавляем сумму долга, срок и ЛС
+    const processedCases = casesWithObligations.map((row, i) => {
+      // Вычисляем общую сумму долга (основной долг + пени)
+      const totalDebt = row.debt_obligations.reduce((sum, obligation) => {
+        const debt = parseFloat(obligation.debt_sum) || 0;
+        const penalty = parseFloat(obligation.penalty_sum) || 0;
+        return sum + debt + penalty;
+      }, 0);
 
-    // Привязываем долги к делу
-    const { error: updateError } = await supabase
-      .from("debt_obligation")
-      .update({ debt_case_id: newCase.id })
-      .in("id", debt_obligation_ids);
+      // Находим самый старый и самый новый срок долга
+      const periods = row.debt_obligations
+        .filter((obligation) => obligation.period_end)
+        .map((obligation) => new Date(obligation.period_end))
+        .sort((a, b) => a - b);
 
-    if (updateError) {
-      console.error("Error updating obligations:", updateError);
-      return res.status(500).json({ error: updateError.message });
-    }
+      const oldestDebtDate = periods.length > 0 ? periods[0] : null;
+      const newestDebtDate =
+        periods.length > 0 ? periods[periods.length - 1] : null;
 
-    // Создаем начальное событие
-    await supabase.from("case_event").insert({
-      debt_case_id: newCase.id,
-      type: "case_created",
-      description: "Дело создано",
-      created_by: "system",
+      // Форматируем срок долга для отображения
+      let debtPeriod = "Нет данных";
+      if (oldestDebtDate && newestDebtDate) {
+        if (oldestDebtDate.getTime() === newestDebtDate.getTime()) {
+          debtPeriod = `до ${formatDate(newestDebtDate)}`;
+        } else {
+          debtPeriod = `с ${formatDate(oldestDebtDate)} по ${formatDate(
+            newestDebtDate
+          )}`;
+        }
+      } else if (newestDebtDate) {
+        debtPeriod = `до ${formatDate(newestDebtDate)}`;
+      }
+
+      // Получаем ЛС (лицевой счет) из debt_obligation
+      // Берем первый попавшийся account из обязательств
+      const account =
+        row.debt_obligations.find((obligation) => obligation.account)
+          ?.account || "Не указан";
+
+      // Формируем полный адрес с ЛС
+      const addressWithAccount = row.premises?.full_address
+        ? `${row.premises.full_address} (ЛС: ${account})`
+        : "Адрес не указан";
+
+      return {
+        ...row,
+        rowIndex: page * size + i + 1,
+        total_debt: totalDebt,
+        debt_period: debtPeriod,
+        oldest_debt_date: oldestDebtDate,
+        newest_debt_date: newestDebtDate,
+        account: account,
+        address_with_account: addressWithAccount,
+        // Дополнительная информация для отладки
+        _debug: {
+          obligations_count: row.debt_obligations.length,
+          periods_count: periods.length,
+        },
+      };
     });
+
+    // Фильтрация по сумме долга если указана
+    let filteredData = processedCases;
+    if (minDebt) {
+      filteredData = filteredData.filter(
+        (item) => item.total_debt >= parseFloat(minDebt)
+      );
+    }
+    if (maxDebt) {
+      filteredData = filteredData.filter(
+        (item) => item.total_debt <= parseFloat(maxDebt)
+      );
+    }
 
     res.json({
-      success: true,
-      case_id: newCase.id,
-      message: `Дело создано с ${debt_obligation_ids.length} долгами`,
+      data: filteredData,
+      total: count,
+      page: parseInt(page, 10),
+      pageSize: size,
     });
   } catch (err) {
-    console.error("Error in /debt-cases POST:", err);
+    console.error("Unexpected error in /debt-cases:", err);
     res.status(500).json({ error: "Internal server error" });
   }
 });
+
+// Вспомогательная функция для форматирования даты
+function formatDate(date) {
+  if (!date) return "";
+  const d = new Date(date);
+  const day = d.getDate().toString().padStart(2, "0");
+  const month = (d.getMonth() + 1).toString().padStart(2, "0");
+  const year = d.getFullYear();
+  return `${day}.${month}.${year}`;
+}
 
 // ===================================================================
 // Эндпоинт: поиск долгов для создания нового дела
